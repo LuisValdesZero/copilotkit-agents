@@ -229,4 +229,5 @@ workflow.add_node("tool_node", ToolNode(tools=backend_tools))
 workflow.add_edge("tool_node", "chat_node")  # Only tool_node -> chat_node
 workflow.set_entry_point("chat_node")
 
+# Compile the workflow
 graph = workflow.compile()
