@@ -150,8 +150,6 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
         except Exception as error:
             print(f"#################### getLearningContext error: {error}")
 
-        print(f"#################### updated_messages: {updated_messages}")
-
     # 4. Run the model to generate a response
     response = await model_with_tools.ainvoke([
         system_message,
