@@ -3,30 +3,31 @@ This is the main entry point for the agent.
 It defines the workflow graph, state, tools, nodes and edges.
 """
 
-from typing import Any, List
 import json
-from typing_extensions import Literal
 import asyncio
+from typing import Any, List, Annotated, Optional
+from pydantic import Field
+from typing_extensions import Literal
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain.tools import tool
+from langchain_core.tools import InjectedToolCallId
 from langgraph.graph import StateGraph, END
 from langgraph.types import Command
 from langgraph.graph import MessagesState
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import ToolNode, InjectedState
 from copilotcloud_rl import getLearningContext
 
 class AgentState(MessagesState):
     """
-    Here we define the state of the agent
+    Defines the state of the agent.
 
-    In this instance, we're inheriting from CopilotKitState, which will bring in
-    the CopilotKitState fields. We're also adding a custom field, `language`,
-    which will be used to set the language of the agent.
+    This class extends MessagesState to include additional fields for agent-specific data.
+    For example, you can add custom fields such as `proverbs` (a list of generated proverbs)
+    or `name` (the agent's current name) to persist information across the agent's workflow.
     """
-    proverbs: List[str] = []
-    tools: List[Any]
+    proverbs: Optional[List[str]] = Field(default_factory=list)
     name: str = ""
 
 @tool
@@ -37,18 +38,52 @@ def get_weather(location: str):
     return f"The weather for {location} is 70 degrees."
 
 @tool
-def set_name(name: str):
+def set_name(name: str, tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
     """
-    Update the agent's name. Always call this when the user asks to change or set the name.
+    Sets or updates the agent's name.
+
+    Parameters:
+        name (str): The new name to assign to the agent.
+        tool_call_id (str): The unique identifier for this tool call (injected automatically).
+
+    Usage:
+        Use this tool whenever the user requests to set or change the agent's name.
     """
-    return json.dumps({"action": "set_name", "name": name})
+    return Command(update={
+        "name": name,
+        "messages": [
+            ToolMessage(f"Updated user name to {name}", tool_call_id=tool_call_id)
+        ]
+    })
 
 @tool
-def generate_proverb(topic: str = ""):
+def generate_proverb(topic: str, state: Annotated[dict, InjectedState], tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
     """
-    Generate a concise, wise proverb using the LLM and persist it into the agent state.
-    Call this when the user asks to generate a proverb. Optionally pass a short 'topic'.
+    Generates a concise, original proverb using a language model and saves it to the agent's state.
+
+    This tool should be called when the user requests a proverb. You may optionally provide a short 'topic'
+    to guide the proverb's theme.
+
+    The generated proverb is:
+    - Universal in wisdom and timeless in style
+    - No longer than 18 words
+    - Returned without quotes or explanations
+
+    The new proverb is appended to the agent's list of proverbs and a message is added to the state.
+
+    Parameters:
+        topic (str): An optional topic to inspire the proverb.
+        state (AgentState): The current state of the agent (injected automatically).
+        tool_call_id (str): The unique identifier for this tool call (injected automatically).
+
+    Returns:
+        Command: An update command containing the new proverb and a message.
     """
+    
+    if 'proverbs' not in state:
+        state['proverbs'] = []
+    current_proverbs = state.get('proverbs', [])
+
     model = ChatOpenAI(model="gpt-4o")
     prompt = (
         "Create a single, concise, original proverb. \n"
@@ -56,31 +91,32 @@ def generate_proverb(topic: str = ""):
         "- No quotes, no explanations, just the proverb.\n"
         f"- Topic (optional): {topic.strip()}\n"
     )
+
     try:
         result = model.invoke([SystemMessage(content="You coin crisp, wise proverbs."), HumanMessage(content=prompt)])
         text = result.content if isinstance(result.content, str) else str(result.content)
         proverb = text.strip().strip('"')
-    except Exception:
+    except Exception as error:
+        print(f"#################### error: {error}")
         proverb = "Wisdom whispers where patience walks."
 
-    return json.dumps({"action": "add_proverb", "proverb": proverb})
-
-# @tool
-# def your_tool_here(your_arg: str):
-#     """Your tool description here."""
-#     print(f"Your tool logic here")
-#     return "Your tool response here."
+    proverbs = current_proverbs + [proverb]
+    
+    return Command(update={
+        "proverbs": proverbs,
+        "messages": [
+            ToolMessage(f"Added proverb: {proverb}", tool_call_id=tool_call_id)
+        ]
+    })
 
 backend_tools = [
     get_weather,
     set_name,
     generate_proverb
-    # your_tool_here
 ]
 
 # Extract tool names from backend_tools for comparison
 backend_tool_names = [tool.name for tool in backend_tools]
-
 
 async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Literal["tool_node", "__end__"]]:
     """
@@ -93,8 +129,6 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
     For more about the ReAct design pattern, see:
     https://www.perplexity.ai/search/react-agents-NcXLQhreS0WDzpVaS4m9Cg
     """
-
-    # 0. Tool execution and state updates are handled in the dedicated tool node
 
     # 1. Define the model
     model = ChatOpenAI(model="gpt-4o")
@@ -116,24 +150,25 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
     # 3. Define the system message by which the chat model will be run
     system_message = SystemMessage(
         content=(
-            "You are a helpful assistant. "
-            f"The current proverbs are {state.get('proverbs', [])}. "
-            "When the user asks to change or set the agent's name, call the set_name tool with the requested name. "
-            "When the user asks to generate a proverb, call generate_proverb with a short topic summarizing their request."
+            "You are a helpful assistant with access to several tools. "
+            f"The current proverbs collection contains: {state.get('proverbs', [])}. "
+            f"The agent's current name is: {state.get('name', 'not set')}. "
+            "\nIMPORTANT TOOL USAGE INSTRUCTIONS:\n"
+            "- When the user asks to change or set the agent's name, ALWAYS call the set_name tool with the requested name.\n"
+            "- When the user requests a proverb, wisdom, saying, or asks you to 'generate', 'create', 'make', or 'give' a proverb, ALWAYS call the generate_proverb tool.\n"
+            "- For weather information, ALWAYS use the get_weather tool.\n"
+            "- Examples of proverb requests: 'give me a proverb', 'create a proverb about love', 'generate wisdom', 'I need a saying', 'make a proverb'.\n"
+            "- Always include a relevant topic when calling generate_proverb (extract from user's request or use a general theme)."
         )
     )
 
-    messages = state.get("messages", [])
-    # print(f"#################### messages: {messages}")
 
+    # Messages are already in LangChain format, no conversion needed
+    langchain_messages = list(state.get("messages", []))
 
-    # To the last HumanMessage add the learning context in the prompt
-    updated_messages = list(state.get("messages", []))
-    # find last HumanMessage
-    # Find the last message and check if it is a HumanMessage
-    if updated_messages and isinstance(updated_messages[-1], HumanMessage):
-
-        human_message = updated_messages[-1]
+    # Find the last message and check if it is a HumanMessage for learning context injection
+    if langchain_messages and isinstance(langchain_messages[-1], HumanMessage):
+        human_message = langchain_messages[-1]
         prompt = human_message.content
 
         print(f"#################### prompt: {prompt}")
@@ -145,15 +180,14 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
             print(f"#################### learning_context: {learningContext}")
             learning_context_text = learningContext if isinstance(learningContext, str) else json.dumps(learningContext)
             injected = f"{prompt}\n\n[Learning context]\n{learning_context_text}"
-            updated_messages[-1] = HumanMessage(content=injected, additional_kwargs=getattr(human_message, "additional_kwargs", {}), response_metadata=getattr(human_message, "response_metadata", {}))
-            state["messages"] = updated_messages
+            langchain_messages[-1] = HumanMessage(content=injected, additional_kwargs=getattr(human_message, "additional_kwargs", {}), response_metadata=getattr(human_message, "response_metadata", {}))
         except Exception as error:
             print(f"#################### getLearningContext error: {error}")
 
     # 4. Run the model to generate a response
     response = await model_with_tools.ainvoke([
         system_message,
-        *state["messages"],
+        *langchain_messages,
     ], config)
 
     # only route to tool node if tool is not in the tools list
@@ -187,64 +221,12 @@ def route_to_tool_node(response: BaseMessage):
             return True
     return False
 
-def _extract_latest_tool_calls(messages: List[Any]):
-    for msg in reversed(messages or []):
-        if hasattr(msg, "tool_calls") and getattr(msg, "tool_calls"):
-            return getattr(msg, "tool_calls")
-    return []
-
-
-async def tool_node(state: AgentState, config: RunnableConfig):
-    updates: dict = {}
-    new_messages: List[Any] = []
-
-    tool_calls = _extract_latest_tool_calls(state.get("messages", []))
-    if not tool_calls:
-        # Nothing to do, go back to chat
-        return Command(goto="chat_node", update={})
-
-    for tc in tool_calls:
-        name = tc.get("name")
-        args = tc.get("args", {}) or {}
-        tc_id = tc.get("id")
-
-        if name == "set_name":
-            new_name = str(args.get("name", "")).strip()
-            if new_name:
-                updates["name"] = new_name
-                new_messages.append(ToolMessage(content=json.dumps({"status": "ok", "name": new_name}), tool_call_id=tc_id))
-
-        elif name == "generate_proverb":
-            topic = str(args.get("topic", "")).strip()
-            model = ChatOpenAI(model="gpt-4o")
-            prompt = (
-                "Create a single, concise, original proverb. \n"
-                "- Style: universal wisdom, timeless, <= 18 words.\n"
-                "- No quotes, no explanations, just the proverb.\n"
-                f"- Topic (optional): {topic}\n"
-            )
-            try:
-                result = await model.ainvoke([SystemMessage(content="You coin crisp, wise proverbs."), HumanMessage(content=prompt)], config)
-                text = result.content if isinstance(result.content, str) else str(result.content)
-                proverb_text = text.strip().strip('"')
-            except Exception:
-                proverb_text = "Wisdom whispers where patience walks."
-
-            current = state.get("proverbs", []) or []
-            updates["proverbs"] = [*current, proverb_text]
-            new_messages.append(ToolMessage(content=json.dumps({"status": "ok", "proverb": proverb_text}), tool_call_id=tc_id))
-
-    if new_messages:
-        updates["messages"] = new_messages
-
-    return Command(goto="chat_node", update=updates)
-
 
 # Define the workflow graph
 workflow = StateGraph(AgentState)
 workflow.add_node("chat_node", chat_node)
-workflow.add_node("tool_node", tool_node)
-workflow.add_edge("tool_node", "chat_node")
+workflow.add_node("tool_node", ToolNode(tools=backend_tools))
+workflow.add_edge("tool_node", "chat_node")  # Only tool_node -> chat_node
 workflow.set_entry_point("chat_node")
 
 graph = workflow.compile()
