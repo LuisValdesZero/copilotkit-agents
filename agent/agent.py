@@ -17,7 +17,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.types import Command
 from langgraph.graph import MessagesState
 from langgraph.prebuilt import ToolNode, InjectedState
-from copilotcloud_rl import getLearningContext
+from copilotcloud_rl import get_learning_context
 
 class AgentState(MessagesState):
     """
@@ -174,7 +174,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
         print(f"#################### prompt: {prompt}")
         try:
             result = await asyncio.to_thread(
-                getLearningContext, prompt=prompt, agentName="sample_agent"
+                get_learning_context, prompt=prompt, agentName="sample_agent", timeout_seconds=300
             )
             learningContext = result["learningContext"]
             print(f"#################### learning_context: {learningContext}")
@@ -182,7 +182,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
             injected = f"{prompt}\n\n[Learning context]\n{learning_context_text}"
             langchain_messages[-1] = HumanMessage(content=injected, additional_kwargs=getattr(human_message, "additional_kwargs", {}), response_metadata=getattr(human_message, "response_metadata", {}))
         except Exception as error:
-            print(f"#################### getLearningContext error: {error}")
+            print(f"#################### get_learning_context error: {error}")
 
     # 4. Run the model to generate a response
     response = await model_with_tools.ainvoke([
